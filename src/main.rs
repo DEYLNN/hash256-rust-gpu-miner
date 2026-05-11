@@ -225,15 +225,22 @@ async fn main() -> Result<()> {
     }
     let signer: PrivateKeySigner = key_trimmed.parse()?;
     let miner_address = signer.address();
-    let wallet = EthereumWallet::from(signer);
+    let wallet = EthereumWallet::from(signer.clone());
 
     let rpc_url_str = std::env::var("RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
+    let tx_rpc_url_str = std::env::var("TX_RPC_URL").unwrap_or_else(|_| rpc_url_str.clone());
     let provider = ProviderBuilder::new()
         .with_recommended_fillers()
         .wallet(wallet)
         .on_http(rpc_url_str.parse()?);
+    let tx_wallet = EthereumWallet::from(signer);
+    let tx_provider = ProviderBuilder::new()
+        .with_recommended_fillers()
+        .wallet(tx_wallet)
+        .on_http(tx_rpc_url_str.parse()?);
 
     let contract = HashToken::new(HASH_CONTRACT_ADDRESS, provider.clone());
+    let tx_contract = HashToken::new(HASH_CONTRACT_ADDRESS, tx_provider.clone());
 
     let num_threads = std::env::var("MINER_THREADS")
         .ok()
@@ -243,6 +250,7 @@ async fn main() -> Result<()> {
     println!("🔨 HASH Miner initialized");
     println!("📍 Miner Address: {}", miner_address);
     println!("⛽ RPC URL: {}", rpc_url_str);
+    println!("🚀 TX RPC URL: {}", tx_rpc_url_str);
     println!("🧵 Worker threads: {}", num_threads);
 
     let submit_enabled = env_bool("SUBMIT", false);
@@ -556,7 +564,7 @@ async fn main() -> Result<()> {
         let priority_wei = (priority_gwei * 1e9) as u128;
         let max_fee_wei = (max_fee_gwei * 1e9) as u128;
 
-        let mut tx = contract
+        let mut tx = tx_contract
             .mine(sol.nonce)
             .max_priority_fee_per_gas(priority_wei)
             .max_fee_per_gas(max_fee_wei);

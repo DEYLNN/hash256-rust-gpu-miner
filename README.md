@@ -38,6 +38,7 @@ Live only after dry-run works and wallet has ETH:
 
 ```env
 RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+TX_RPC_URL=https://rpc.flashbots.net/fast
 PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 SUBMIT=false
 GPU=1
