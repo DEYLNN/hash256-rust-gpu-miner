@@ -550,7 +550,8 @@ async fn main() -> Result<()> {
                                 });
                             }
                         });
-                        Ok::<Option<u64>, eyre::Report>(*solution.lock().unwrap())
+                        let found = *solution.lock().unwrap();
+                        Ok::<Option<u64>, eyre::Report>(found)
                     })
                     .await?;
                     res?.map(|n| Solution {
