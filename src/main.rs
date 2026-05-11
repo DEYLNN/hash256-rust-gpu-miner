@@ -1,7 +1,7 @@
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::process::Command;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{address, keccak256, Address, B256, U256};
@@ -144,21 +144,44 @@ fn env_bool(name: &str, default: bool) -> bool {
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn telegram_send(text: &str) {
-    let token = match std::env::var("TELEGRAM_BOT_TOKEN") { Ok(v) if !v.is_empty() => v, _ => return };
-    let chat_id = match std::env::var("TELEGRAM_CHAT_ID") { Ok(v) if !v.is_empty() => v, _ => return };
+    let token = match std::env::var("TELEGRAM_BOT_TOKEN") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    let chat_id = match std::env::var("TELEGRAM_CHAT_ID") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
     let mut last_err = None;
     for _ in 0..3 {
         let out = Command::new("curl")
-            .args(["-fsS", "--max-time", "15", "-X", "POST", &url, "-d", &format!("chat_id={}", chat_id), "--data-urlencode", &format!("text={}", text)])
+            .args([
+                "-fsS",
+                "--max-time",
+                "15",
+                "-X",
+                "POST",
+                &url,
+                "-d",
+                &format!("chat_id={}", chat_id),
+                "--data-urlencode",
+                &format!("text={}", text),
+            ])
             .output();
         match out {
             Ok(o) if o.status.success() => return,
@@ -167,13 +190,19 @@ fn telegram_send(text: &str) {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
-    if let Some(e) = last_err { eprintln!("telegram send failed: {e}"); }
+    if let Some(e) = last_err {
+        eprintln!("telegram send failed: {e}");
+    }
 }
 
 fn report_title() -> String {
     std::env::var("REPORT_TITLE").unwrap_or_else(|_| "HASH256 Rust GPU Miner".to_string())
 }
 
+fn short_addr(addr: Address) -> String {
+    let a = addr.to_string();
+    format!("{}...{}", &a[..8], &a[a.len() - 6..])
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -218,8 +247,16 @@ async fn main() -> Result<()> {
 
     let submit_enabled = env_bool("SUBMIT", false);
     let report_interval = Duration::from_millis(env_u64("REPORT_INTERVAL_MS", 60000));
-    let mut last_report = Instant::now() - report_interval;
-    println!("🚦 Submit TX: {}", if submit_enabled { "ENABLED" } else { "DRY-RUN" });
+    let priority_gwei_cfg: f64 = env_f64("PRIORITY_GWEI", 1.0);
+    let max_fee_gwei_cfg: f64 = env_f64("MAX_FEE_GWEI", 30.0);
+    println!(
+        "🚦 Submit TX: {}",
+        if submit_enabled { "ENABLED" } else { "DRY-RUN" }
+    );
+    println!(
+        "⛽ Gas policy: priority={} gwei, maxFee={} gwei",
+        priority_gwei_cfg, max_fee_gwei_cfg
+    );
 
     // --- Initial info via miningState() (one RPC call instead of four) ---
     match contract.miningState().call().await {
@@ -228,7 +265,11 @@ async fn main() -> Result<()> {
             println!("   Era: {}", s.era);
             println!("   Reward: {} (raw, 1e18)", s.reward);
             println!("   Difficulty: {}", s.difficulty);
-            println!("   Mining minted: {} / {}", s.minted, s.minted + s.remaining);
+            println!(
+                "   Mining minted: {} / {}",
+                s.minted,
+                s.minted + s.remaining
+            );
             println!("   Current epoch: {}", s.epoch);
             println!("   Blocks left in epoch: {}", s.epochBlocksLeft);
         }
@@ -330,7 +371,10 @@ async fn main() -> Result<()> {
         println!("   Block: {}  Epoch: {}", block_num, epoch);
         println!("   Difficulty: {}", difficulty);
         println!("   Challenge: 0x{}...", hex_short(challenge.as_slice()));
-        println!("⛏️  Mining epoch {} on {} ({} threads)...", epoch, backend, num_threads);
+        println!(
+            "⛏️  Mining epoch {} on {} ({} threads)...",
+            epoch, backend, num_threads
+        );
 
         // u64 random start works for both backends; CPU widens via U256::from.
         let start_nonce_u64: u64 = rand::thread_rng().gen();
@@ -346,9 +390,17 @@ async fn main() -> Result<()> {
             let shutdown = Arc::clone(&shutdown);
             let provider = provider.clone();
             let target_epoch = epoch;
+            let report_interval = report_interval;
+            let title = report_title();
+            let wallet_short = short_addr(miner_address);
+            let backend = backend.to_string();
+            let submit_label = if submit_enabled { "ON" } else { "DRY-RUN" }.to_string();
+            let priority_gwei = priority_gwei_cfg;
+            let max_fee_gwei = max_fee_gwei_cfg;
             let round_start = Instant::now();
             tokio::spawn(async move {
                 let mut last_print = Instant::now();
+                let mut last_report = Instant::now() - report_interval;
                 let mut last_attempts: u64 = 0;
                 let mut last_poll = Instant::now();
                 loop {
@@ -373,6 +425,18 @@ async fn main() -> Result<()> {
                         );
                         last_attempts = total;
                         last_print = Instant::now();
+                    }
+
+                    if last_report.elapsed() >= report_interval {
+                        let total = attempts_counter.load(Ordering::Relaxed);
+                        let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
+                        let avg_rate = total as f64 / elapsed;
+                        let text = format!(
+                            "⛏ {title}\n\nStatus: RUNNING\nBackend: {backend}\nWallet: {wallet_short}\nEpoch: {target_epoch}\nSubmit: {submit_label}\nHashrate avg: {:.2} H/s\nAttempts: {}\nRuntime: {:.0}s\n\nGas policy:\n• Priority fee: {} gwei\n• Max fee: {} gwei\n• Gas limit: auto/override\n\nEvent: no nonce yet",
+                            avg_rate, total, elapsed, priority_gwei, max_fee_gwei
+                        );
+                        telegram_send(&text);
+                        last_report = Instant::now();
                     }
 
                     if last_poll.elapsed() >= EPOCH_POLL_INTERVAL {
@@ -405,7 +469,13 @@ async fn main() -> Result<()> {
             {
                 if let Some(g) = gpu_miner.as_ref().cloned() {
                     let res = tokio::task::spawn_blocking(move || {
-                        g.mine(challenge, difficulty, start_nonce_u64, stop_flag, attempts_counter)
+                        g.mine(
+                            challenge,
+                            difficulty,
+                            start_nonce_u64,
+                            stop_flag,
+                            attempts_counter,
+                        )
                     })
                     .await?;
                     match res {
@@ -422,8 +492,13 @@ async fn main() -> Result<()> {
                 } else {
                     tokio::task::spawn_blocking(move || {
                         run_workers(
-                            challenge, difficulty, epoch, start_nonce,
-                            stop_flag, attempts_counter, num_threads,
+                            challenge,
+                            difficulty,
+                            epoch,
+                            start_nonce,
+                            stop_flag,
+                            attempts_counter,
+                            num_threads,
                         )
                     })
                     .await?
@@ -435,8 +510,13 @@ async fn main() -> Result<()> {
                 let _ = &gpu_miner; // silence unused
                 tokio::task::spawn_blocking(move || {
                     run_workers(
-                        challenge, difficulty, epoch, start_nonce,
-                        stop_flag, attempts_counter, num_threads,
+                        challenge,
+                        difficulty,
+                        epoch,
+                        start_nonce,
+                        stop_flag,
+                        attempts_counter,
+                        num_threads,
                     )
                 })
                 .await?
@@ -460,14 +540,8 @@ async fn main() -> Result<()> {
         // MAX_FEE_GWEI:  absolute ceiling; you only pay this if base_fee spikes.
         //                Effective gas = min(MAX_FEE, base_fee + PRIORITY).
         // GAS_LIMIT_OVERRIDE: optional fixed gas limit.
-        let priority_gwei: f64 = std::env::var("PRIORITY_GWEI")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
-        let max_fee_gwei: f64 = std::env::var("MAX_FEE_GWEI")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30.0);
+        let priority_gwei: f64 = priority_gwei_cfg;
+        let max_fee_gwei: f64 = max_fee_gwei_cfg;
         let priority_wei = (priority_gwei * 1e9) as u128;
         let max_fee_wei = (max_fee_gwei * 1e9) as u128;
 
@@ -481,12 +555,16 @@ async fn main() -> Result<()> {
         {
             tx = tx.gas(g);
         }
-        println!(
-            "💸 Gas: priority={priority_gwei} gwei, maxFee={max_fee_gwei} gwei (ceiling)"
-        );
+        println!("💸 Gas: priority={priority_gwei} gwei, maxFee={max_fee_gwei} gwei (ceiling)");
 
         if !submit_enabled {
-            let msg = format!("⛏ {}\nDRY-RUN FOUND nonce={} epoch={}\nGPU={}\nSubmit TX: OFF", report_title(), sol.nonce, sol.epoch, if gpu_miner.is_some() { "ON" } else { "OFF" });
+            let msg = format!(
+                "⛏ {}\nDRY-RUN FOUND nonce={} epoch={}\nGPU={}\nSubmit TX: OFF",
+                report_title(),
+                sol.nonce,
+                sol.epoch,
+                if gpu_miner.is_some() { "ON" } else { "OFF" }
+            );
             println!("🧪 DRY-RUN: valid nonce found, not submitting tx. Set SUBMIT=true to enable live submit.");
             telegram_send(&msg);
             continue;
@@ -496,7 +574,7 @@ async fn main() -> Result<()> {
             Ok(pending) => {
                 let tx_hash = *pending.tx_hash();
                 println!("📋 Transaction submitted: {tx_hash}");
-                telegram_send(&format!("⛏ {}\nTX sent: {tx_hash}\nnonce={} epoch={}", report_title(), sol.nonce, sol.epoch));
+                telegram_send(&format!("📤 {}\nTX sent: {tx_hash}\nnonce={} epoch={}\nGas policy: priority={} gwei, maxFee={} gwei", report_title(), sol.nonce, sol.epoch, priority_gwei, max_fee_gwei));
                 println!("⏳ Waiting for confirmation...");
                 match pending.with_required_confirmations(1).get_receipt().await {
                     Ok(receipt) => {
@@ -507,25 +585,29 @@ async fn main() -> Result<()> {
                             );
                             println!("🔗 https://etherscan.io/tx/{tx_hash}");
                             success_count += 1;
-                            telegram_send(&format!("✅ {}\nSUCCESS block={}\ntx=https://etherscan.io/tx/{tx_hash}", report_title(), receipt.block_number.unwrap_or_default()));
+                            telegram_send(&format!("✅ {}\nSUCCESS block={}\ntx=https://etherscan.io/tx/{tx_hash}\nGas used: {}", report_title(), receipt.block_number.unwrap_or_default(), receipt.gas_used));
                             if let Ok(total_mints) = contract.totalMints().call().await {
                                 println!(
                                     "🏆 Mined ~{} HASH tokens",
                                     reward_for_total_mints(total_mints._0)
                                 );
-                                println!(
-                                    "📈 Total successful mints this session: {success_count}"
-                                );
+                                println!("📈 Total successful mints this session: {success_count}");
                             }
                         } else {
                             println!("❌ Transaction reverted (status=0)");
-                            telegram_send(&format!("❌ {}\nTX reverted: {tx_hash}", report_title()));
+                            telegram_send(&format!(
+                                "❌ {}\nTX reverted: {tx_hash}",
+                                report_title()
+                            ));
                         }
                     }
                     Err(e) => eprintln!("❌ Receipt error: {e}"),
                 }
             }
-            Err(e) => { eprintln!("❌ Submission failed: {e}"); telegram_send(&format!("❌ {}\nSubmission failed: {e}", report_title())); },
+            Err(e) => {
+                eprintln!("❌ Submission failed: {e}");
+                telegram_send(&format!("❌ {}\nSubmission failed: {e}", report_title()));
+            }
         }
     }
 
