@@ -299,34 +299,62 @@ async fn main() -> Result<()> {
     // --- Optional GPU backend ---
     let gpu_enabled = env_bool("GPU", false);
     #[cfg(feature = "gpu")]
-    let gpu_miner: Option<Arc<gpu::GpuMiner>> = if gpu_enabled {
+    let gpu_miners: Vec<Arc<gpu::GpuMiner>> = if gpu_enabled {
         let batch = std::env::var("GPU_BATCH")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
-        match gpu::GpuMiner::new(batch) {
-            Ok(g) => {
-                println!("🎮 GPU device: {}", g.device_name());
-                println!("🎮 GPU batch size: {} nonces/dispatch", g.batch_size());
-                match g.self_test() {
-                    Ok(()) => println!("✅ GPU self-test passed"),
-                    Err(e) => return Err(eyre!("GPU self-test FAILED — aborting: {e}")),
+        let requested = std::env::var("GPU_DEVICES").unwrap_or_else(|_| "auto".to_string());
+        let available = gpu::GpuMiner::list_device_names().unwrap_or_default();
+        println!("🎮 OpenCL devices available: {}", available.len());
+        for (i, name) in available.iter().enumerate() {
+            println!("   [{i}] {name}");
+        }
+        let indices: Vec<usize> =
+            if requested.trim().eq_ignore_ascii_case("auto") || requested.trim().is_empty() {
+                (0..available.len()).collect()
+            } else {
+                requested
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .collect()
+            };
+        let mut miners = Vec::new();
+        for idx in indices {
+            match gpu::GpuMiner::new_for_index(idx, batch) {
+                Ok(g) => {
+                    println!("🎮 GPU device [{idx}]: {}", g.device_name());
+                    println!(
+                        "🎮 GPU batch size [{idx}]: {} nonces/dispatch",
+                        g.batch_size()
+                    );
+                    match g.self_test() {
+                        Ok(()) => {
+                            println!("✅ GPU self-test passed on device [{idx}]");
+                            miners.push(Arc::new(g));
+                        }
+                        Err(e) => {
+                            return Err(eyre!(
+                                "GPU self-test FAILED on device [{idx}] — aborting: {e}"
+                            ))
+                        }
+                    }
                 }
-                Some(Arc::new(g))
-            }
-            Err(e) => {
-                eprintln!("⚠️  GPU init failed, falling back to CPU: {e}");
-                None
+                Err(e) => eprintln!("⚠️  GPU init failed on device [{idx}]: {e}. Skipping device."),
             }
         }
+        if miners.is_empty() {
+            eprintln!("⚠️  No usable GPU devices. Falling back to CPU.");
+        }
+        miners
     } else {
-        None
+        Vec::new()
     };
     #[cfg(not(feature = "gpu"))]
-    let gpu_miner: Option<()> = {
+    let gpu_miners: Vec<()> = {
         if gpu_enabled {
             eprintln!("⚠️  GPU=1 set but binary built without the `gpu` feature. Using CPU.");
         }
-        None
+        Vec::new()
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -375,7 +403,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        let backend = if gpu_miner.is_some() { "GPU" } else { "CPU" };
+        let backend = if !gpu_miners.is_empty() { "GPU" } else { "CPU" };
         println!("\n📊 Round start:");
         println!("   Block: {}  Epoch: {}", block_num, epoch);
         println!("   Difficulty: {}", difficulty);
@@ -486,28 +514,49 @@ async fn main() -> Result<()> {
 
             #[cfg(feature = "gpu")]
             {
-                if let Some(g) = gpu_miner.as_ref().cloned() {
+                if !gpu_miners.is_empty() {
+                    let miners = gpu_miners.clone();
                     let res = tokio::task::spawn_blocking(move || {
-                        g.mine(
-                            challenge,
-                            difficulty,
-                            start_nonce_u64,
-                            stop_flag,
-                            attempts_counter,
-                        )
+                        let solution = Arc::new(Mutex::new(None::<u64>));
+                        std::thread::scope(|scope| {
+                            let gpu_count = miners.len() as u64;
+                            let batch_size = miners[0].batch_size() as u64;
+                            let nonce_stride = batch_size.saturating_mul(gpu_count).max(batch_size);
+                            for (idx, miner) in miners.iter().enumerate() {
+                                let miner = Arc::clone(miner);
+                                let stop_flag = Arc::clone(&stop_flag);
+                                let attempts_counter = Arc::clone(&attempts_counter);
+                                let solution = Arc::clone(&solution);
+                                let device_start = start_nonce_u64
+                                    .wrapping_add((idx as u64).saturating_mul(batch_size));
+                                scope.spawn(move || {
+                                    match miner.mine(
+                                        challenge,
+                                        difficulty,
+                                        device_start,
+                                        nonce_stride,
+                                        stop_flag,
+                                        attempts_counter,
+                                    ) {
+                                        Ok(Some(nonce)) => {
+                                            let mut slot = solution.lock().unwrap();
+                                            if slot.is_none() {
+                                                *slot = Some(nonce);
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => eprintln!("⚠️  GPU worker {idx} failed: {e}"),
+                                    }
+                                });
+                            }
+                        });
+                        Ok::<Option<u64>, eyre::Report>(*solution.lock().unwrap())
                     })
                     .await?;
-                    match res {
-                        Ok(Some(nonce_u64)) => Some(Solution {
-                            nonce: U256::from(nonce_u64),
-                            epoch,
-                        }),
-                        Ok(None) => None,
-                        Err(e) => {
-                            eprintln!("❌ GPU mining error: {e}");
-                            None
-                        }
-                    }
+                    res?.map(|n| Solution {
+                        nonce: U256::from(n),
+                        epoch,
+                    })
                 } else {
                     tokio::task::spawn_blocking(move || {
                         run_workers(
@@ -526,7 +575,7 @@ async fn main() -> Result<()> {
 
             #[cfg(not(feature = "gpu"))]
             {
-                let _ = &gpu_miner; // silence unused
+                let _ = &gpu_miners; // silence unused
                 tokio::task::spawn_blocking(move || {
                     run_workers(
                         challenge,
@@ -582,7 +631,7 @@ async fn main() -> Result<()> {
                 report_title(),
                 sol.nonce,
                 sol.epoch,
-                if gpu_miner.is_some() { "ON" } else { "OFF" }
+                if !gpu_miners.is_empty() { "ON" } else { "OFF" }
             );
             println!("🧪 DRY-RUN: valid nonce found, not submitting tx. Set SUBMIT=true to enable live submit.");
             telegram_send(&msg);
