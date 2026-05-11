@@ -25,10 +25,32 @@ pub struct GpuMiner {
 
 impl GpuMiner {
     pub fn new(batch_size: Option<usize>) -> Result<Self> {
+        Self::new_for_index(0, batch_size)
+    }
+
+    pub fn list_device_names() -> Result<Vec<String>> {
+        let platform = Platform::default();
+        let devices =
+            Device::list_all(platform).map_err(|e| eyre!("no OpenCL devices found: {e}"))?;
+        Ok(devices
+            .into_iter()
+            .map(|d| d.name().unwrap_or_else(|_| "<unknown>".into()))
+            .collect())
+    }
+
+    pub fn new_for_index(device_index: usize, batch_size: Option<usize>) -> Result<Self> {
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH);
 
         let platform = Platform::default();
-        let device = Device::first(platform).map_err(|e| eyre!("no OpenCL device found: {e}"))?;
+        let devices =
+            Device::list_all(platform).map_err(|e| eyre!("no OpenCL devices found: {e}"))?;
+        let device = *devices.get(device_index).ok_or_else(|| {
+            eyre!(
+                "OpenCL device index {} not found ({} device(s) available)",
+                device_index,
+                devices.len()
+            )
+        })?;
         let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
 
         let context = Context::builder()
@@ -147,6 +169,7 @@ impl GpuMiner {
         challenge: B256,
         difficulty: U256,
         start_nonce: u64,
+        nonce_stride: u64,
         stop_flag: Arc<AtomicBool>,
         attempts_counter: Arc<AtomicU64>,
     ) -> Result<Option<u64>> {
@@ -228,7 +251,7 @@ impl GpuMiner {
                 }
             }
 
-            nonce_base = nonce_base.wrapping_add(self.batch_size as u64);
+            nonce_base = nonce_base.wrapping_add(nonce_stride);
 
             // Yield briefly so the stop_flag check has time to land.
             // (1us is enough to not break GPU saturation.)
