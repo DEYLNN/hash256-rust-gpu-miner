@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{keccak256, B256, U256};
 use eyre::{eyre, Result};
@@ -28,8 +28,7 @@ impl GpuMiner {
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH);
 
         let platform = Platform::default();
-        let device = Device::first(platform)
-            .map_err(|e| eyre!("no OpenCL device found: {e}"))?;
+        let device = Device::first(platform).map_err(|e| eyre!("no OpenCL device found: {e}"))?;
         let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
 
         let context = Context::builder()
@@ -70,7 +69,10 @@ impl GpuMiner {
         let nonce_base: u64 = 12345;
 
         // Run a 1-thread batch (global size = 1, work-item 0 gets nonce_base).
-        let (cw, dw) = (split_challenge_le(&challenge), split_difficulty_be(difficulty));
+        let (cw, dw) = (
+            split_challenge_le(&challenge),
+            split_difficulty_be(difficulty),
+        );
 
         let found_nonce = Buffer::<u64>::builder()
             .queue(self.queue.clone())
@@ -90,20 +92,30 @@ impl GpuMiner {
             .name("mine_keccak")
             .queue(self.queue.clone())
             .global_work_size(1usize)
-            .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
-            .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
+            .arg(cw[0])
+            .arg(cw[1])
+            .arg(cw[2])
+            .arg(cw[3])
+            .arg(dw[0])
+            .arg(dw[1])
+            .arg(dw[2])
+            .arg(dw[3])
             .arg(nonce_base)
             .arg(&found_nonce)
             .arg(&found_flag)
             .build()?;
 
-        unsafe { kernel.enq()?; }
+        unsafe {
+            kernel.enq()?;
+        }
         self.queue.finish()?;
 
         let mut flag = [0i32];
         found_flag.read(&mut flag[..]).enq()?;
         if flag[0] == 0 {
-            return Err(eyre!("self-test: GPU did not report any hit against MAX difficulty"));
+            return Err(eyre!(
+                "self-test: GPU did not report any hit against MAX difficulty"
+            ));
         }
 
         let mut got = [0u64];
@@ -154,9 +166,17 @@ impl GpuMiner {
             .copy_host_slice(&[0i32])
             .build()?;
 
+        let max_round_secs = std::env::var("GPU_MAX_ROUND_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(20);
+        let round_deadline = Instant::now() + Duration::from_secs(max_round_secs);
         let mut nonce_base: u64 = start_nonce;
         loop {
             if stop_flag.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            if Instant::now() >= round_deadline {
                 return Ok(None);
             }
 
@@ -169,14 +189,22 @@ impl GpuMiner {
                 .name("mine_keccak")
                 .queue(self.queue.clone())
                 .global_work_size(self.batch_size)
-                .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
-                .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
+                .arg(cw[0])
+                .arg(cw[1])
+                .arg(cw[2])
+                .arg(cw[3])
+                .arg(dw[0])
+                .arg(dw[1])
+                .arg(dw[2])
+                .arg(dw[3])
                 .arg(nonce_base)
                 .arg(&found_nonce)
                 .arg(&found_flag)
                 .build()?;
 
-            unsafe { kernel.enq()?; }
+            unsafe {
+                kernel.enq()?;
+            }
             self.queue.finish()?;
 
             attempts_counter.fetch_add(self.batch_size as u64, Ordering::Relaxed);
