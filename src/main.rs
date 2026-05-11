@@ -257,6 +257,7 @@ async fn main() -> Result<()> {
         "⛽ Gas policy: priority={} gwei, maxFee={} gwei",
         priority_gwei_cfg, max_fee_gwei_cfg
     );
+    let global_last_report = Arc::new(Mutex::new(Instant::now() - report_interval));
 
     // --- Initial info via miningState() (one RPC call instead of four) ---
     match contract.miningState().call().await {
@@ -397,10 +398,10 @@ async fn main() -> Result<()> {
             let submit_label = if submit_enabled { "ON" } else { "DRY-RUN" }.to_string();
             let priority_gwei = priority_gwei_cfg;
             let max_fee_gwei = max_fee_gwei_cfg;
+            let global_last_report = Arc::clone(&global_last_report);
             let round_start = Instant::now();
             tokio::spawn(async move {
                 let mut last_print = Instant::now();
-                let mut last_report = Instant::now() - report_interval;
                 let mut last_attempts: u64 = 0;
                 let mut last_poll = Instant::now();
                 loop {
@@ -427,16 +428,26 @@ async fn main() -> Result<()> {
                         last_print = Instant::now();
                     }
 
-                    if last_report.elapsed() >= report_interval {
-                        let total = attempts_counter.load(Ordering::Relaxed);
-                        let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
-                        let avg_rate = total as f64 / elapsed;
-                        let text = format!(
-                            "⛏ {title}\n\nStatus: RUNNING\nBackend: {backend}\nWallet: {wallet_short}\nEpoch: {target_epoch}\nSubmit: {submit_label}\nHashrate avg: {:.2} H/s\nAttempts: {}\nRuntime: {:.0}s\n\nGas policy:\n• Priority fee: {} gwei\n• Max fee: {} gwei\n• Gas limit: auto/override\n\nEvent: no nonce yet",
-                            avg_rate, total, elapsed, priority_gwei, max_fee_gwei
-                        );
-                        telegram_send(&text);
-                        last_report = Instant::now();
+                    {
+                        let should_report = {
+                            let mut last_report = global_last_report.lock().unwrap();
+                            if last_report.elapsed() >= report_interval {
+                                *last_report = Instant::now();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_report {
+                            let total = attempts_counter.load(Ordering::Relaxed);
+                            let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
+                            let avg_rate = total as f64 / elapsed;
+                            let text = format!(
+                                "⛏ {title}\n\nStatus: RUNNING\nBackend: {backend}\nWallet: {wallet_short}\nEpoch: {target_epoch}\nSubmit: {submit_label}\nHashrate avg: {:.2} H/s\nAttempts: {}\nRound runtime: {:.0}s\n\nGas policy:\n• Priority fee: {} gwei\n• Max fee: {} gwei\n• Gas limit: auto/override\n\nEvent: no nonce yet",
+                                avg_rate, total, elapsed, priority_gwei, max_fee_gwei
+                            );
+                            telegram_send(&text);
+                        }
                     }
 
                     if last_poll.elapsed() >= EPOCH_POLL_INTERVAL {
